@@ -1,0 +1,274 @@
+name: Provision DEV EC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      admin_cidrs:
+        description: "SSH allowed CIDRs (comma separated). Empty = auto-detect runner IP."
+        required: false
+        default: ""
+      force_recreate:
+        description: "Terminate existing dev instance and recreate (dangerous)"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: provision-dev
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    environment: dev
+
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.PROV_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.PROV_AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      REGION: us-east-1
+      PROJECT: myapp
+      ENV: dev
+      ROLE_NAME: myapp-dev-ec2-role
+      PROFILE_NAME: myapp-dev-ec2-profile
+      SG_NAME: myapp-dev-sg
+      INSTANCE_TYPE: t2.micro        # 若账号支持 t1.micro 可改回
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve vars
+        id: vars
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="myapp-bootstrap-${ACCOUNT}"
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+
+          if [ -z "${{ inputs.admin_cidrs }}" ]; then
+            ADMIN_CIDRS="$(curl -fsS https://checkip.amazonaws.com)/32"
+          else
+            ADMIN_CIDRS="${{ inputs.admin_cidrs }}"
+          fi
+          echo "admin_cidrs=$ADMIN_CIDRS" >> "$GITHUB_OUTPUT"
+
+          AL2_AMI=$(aws ec2 describe-images \
+            --region "$REGION" --owners amazon \
+            --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" "Name=state,Values=available" \
+            --query "sort_by(Images,&CreationDate)[-1].ImageId" --output text)
+          echo "ami=$AL2_AMI" >> "$GITHUB_OUTPUT"
+
+      # ---------- 上传 startup.sh（幂等覆盖） ----------
+      - name: Upload startup.sh to S3
+        run: |
+          aws s3 cp scripts/startup.sh "s3://${{ steps.vars.outputs.bucket }}/scripts/startup.sh" \
+            --region "$REGION" --content-type text/x-shellscript
+
+      # ---------- IAM Role / Policy / Instance Profile（幂等） ----------
+      - name: Ensure IAM role & instance profile
+        run: |
+          set -euo pipefail
+          if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            echo "Role $ROLE_NAME exists"
+          else
+            cat >/tmp/ec2-trust.json <<'EOF'
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Principal": { "Service": "ec2.amazonaws.com" },
+              "Action": "sts:AssumeRole"
+            }]
+          }
+          EOF
+            aws iam create-role --role-name "$ROLE_NAME" \
+              --assume-role-policy-document file:///tmp/ec2-trust.json
+          fi
+
+          cat >/tmp/ec2-s3-read.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Action": ["s3:GetObject"],
+              "Resource": "arn:aws:s3:::${{ steps.vars.outputs.bucket }}/scripts/startup.sh"
+            }]
+          }
+          EOF
+          aws iam put-role-policy --role-name "$ROLE_NAME" \
+            --policy-name read-startup \
+            --policy-document file:///tmp/ec2-s3-read.json
+
+          aws iam attach-role-policy --role-name "$ROLE_NAME" \
+            --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+          if aws iam get-instance-profile --instance-profile-name "$PROFILE_NAME" >/dev/null 2>&1; then
+            echo "Profile $PROFILE_NAME exists"
+          else
+            aws iam create-instance-profile --instance-profile-name "$PROFILE_NAME"
+          fi
+          aws iam add-role-to-instance-profile \
+            --instance-profile-name "$PROFILE_NAME" \
+            --role-name "$ROLE_NAME" 2>/dev/null || true
+
+          # IAM 生效延迟
+          sleep 10
+
+      # ---------- Security Group（幂等 + CIDR 幂等放通） ----------
+      - name: Ensure security group
+        id: sg
+        run: |
+          set -euo pipefail
+          VPC_ID=$(aws ec2 describe-vpcs --region "$REGION" \
+            --filters Name=isDefault,Values=true \
+            --query "Vpcs[0].VpcId" --output text)
+
+          SG_ID=$(aws ec2 describe-security-groups --region "$REGION" \
+            --filters "Name=group-name,Values=${SG_NAME}" "Name=vpc-id,Values=${VPC_ID}" \
+            --query "SecurityGroups[0].GroupId" --output text)
+
+          if [[ "$SG_ID" == "None" || -z "$SG_ID" ]]; then
+            SG_ID=$(aws ec2 create-security-group --region "$REGION" \
+              --group-name "$SG_NAME" \
+              --description "SG for ${PROJECT} ${ENV}" \
+              --vpc-id "$VPC_ID" --query GroupId --output text)
+            aws ec2 create-tags --region "$REGION" --resources "$SG_ID" \
+              --tags Key=Name,Value=$SG_NAME Key=env,Value=$ENV
+            echo "Created SG $SG_ID"
+          else
+            echo "Reused SG $SG_ID"
+          fi
+
+          IFS=',' read -ra CIDRS <<< "${{ steps.vars.outputs.admin_cidrs }}"
+          for CIDR in "${CIDRS[@]}"; do
+            CIDR_TRIM=$(echo "$CIDR" | xargs)
+            [[ -z "$CIDR_TRIM" ]] && continue
+            aws ec2 authorize-security-group-ingress --region "$REGION" \
+              --group-id "$SG_ID" \
+              --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${CIDR_TRIM},Description=\"SSH from admin\"}]" \
+              2>/dev/null && echo "Opened 22: $CIDR_TRIM" || echo "22 already: $CIDR_TRIM"
+          done
+
+          aws ec2 authorize-security-group-ingress --region "$REGION" \
+            --group-id "$SG_ID" \
+            --ip-permissions "IpProtocol=tcp,FromPort=8080,ToPort=8080,IpRanges=[{CidrIp=10.0.0.0/8,Description=\"App port internal\"}]" \
+            2>/dev/null && echo "Opened 8080(internal)" || echo "8080 already"
+
+          echo "sg_id=$SG_ID" >> "$GITHUB_OUTPUT"
+          echo "vpc_id=$VPC_ID" >> "$GITHUB_OUTPUT"
+
+      # ---------- user_data ----------
+      - name: Render user_data
+        run: |
+          set -euo pipefail
+          BUCKET="${{ steps.vars.outputs.bucket }}"
+          cat >/tmp/user-data.sh <<EOF
+          #!/bin/bash
+          set -euxo pipefail
+          yum update -y || true
+          yum install -y curl awscli dos2unix
+
+          cat >/usr/local/bin/run-startup.sh <<'WRAP'
+          #!/bin/bash
+          set -euo pipefail
+          BUCKET="${BUCKET}"
+          KEY="scripts/startup.sh"
+          ENV="${ENV}"
+          PROJECT="${PROJECT}"
+          REGION="${REGION}"
+          LOCAL=/usr/local/bin/startup.sh
+
+          aws s3 cp "s3://\$BUCKET/\$KEY" "\$LOCAL" --region "\$REGION"
+          dos2unix "\$LOCAL" >/dev/null 2>&1 || sed -i 's/\r$//' "\$LOCAL"
+          chmod +x "\$LOCAL"
+          ENV_NAME="\$ENV" PROJECT="\$PROJECT" "\$LOCAL"
+          WRAP
+          chmod +x /usr/local/bin/run-startup.sh
+
+          cat >/etc/systemd/system/startup.service <<'UNIT'
+          [Unit]
+          Description=Run idempotent startup script from S3
+          After=network-online.target cloud-init.service
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/run-startup.sh
+          RemainAfterExit=no
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          systemctl daemon-reload
+          systemctl enable startup.service
+          systemctl start startup.service || true
+          EOF
+          cat /tmp/user-data.sh
+
+      # ---------- EC2（幂等创建/复用） ----------
+      - name: Create or reuse EC2
+        id: ec2
+        run: |
+          set -euo pipefail
+          VPC_ID="${{ steps.sg.outputs.vpc_id }}"
+          SUBNET_ID=$(aws ec2 describe-subnets --region "$REGION" \
+            --filters Name=vpc-id,Values="$VPC_ID" \
+            --query "Subnets[0].SubnetId" --output text)
+
+          EXIST_ID=$(aws ec2 describe-instances --region "$REGION" \
+            --filters "Name=tag:env,Values=${ENV}" \
+                      "Name=instance-state-name,Values=pending,running,stopped" \
+            --query "Reservations[0].Instances[0].InstanceId" --output text || true)
+
+          if [[ "${{ inputs.force_recreate }}" == "true" && -n "$EXIST_ID" && "$EXIST_ID" != "None" ]]; then
+            echo "force_recreate: terminating $EXIST_ID"
+            aws ec2 terminate-instances --region "$REGION" --instance-ids "$EXIST_ID"
+            aws ec2 wait instance-terminated --region "$REGION" --instance-ids "$EXIST_ID"
+            EXIST_ID=""
+          fi
+
+          if [[ -z "$EXIST_ID" || "$EXIST_ID" == "None" ]]; then
+            INSTANCE_ID=$(aws ec2 run-instances --region "$REGION" \
+              --image-id "${{ steps.vars.outputs.ami }}" \
+              --instance-type "$INSTANCE_TYPE" \
+              --key-name app-key \
+              --security-group-ids "${{ steps.sg.outputs.sg_id }}" \
+              --subnet-id "$SUBNET_ID" \
+              --iam-instance-profile Name="$PROFILE_NAME" \
+              --user-data file:///tmp/user-data.sh \
+              --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":20,"VolumeType":"gp2"}}]' \
+              --tag-specifications \
+                "ResourceType=instance,Tags=[{Key=Name,Value=${PROJECT}-${ENV}},{Key=env,Value=${ENV}},{Key=owner,Value=platform}]" \
+              --query "Instances[0].InstanceId" --output text)
+            echo "Created instance $INSTANCE_ID"
+          else
+            INSTANCE_ID="$EXIST_ID"
+            echo "Reused instance $INSTANCE_ID"
+          fi
+
+          aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
+
+          IP=$(aws ec2 describe-instances --region "$REGION" \
+            --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "DEV_PUBLIC_IP=$IP"
+
+      - name: Wait for startup.sh (best-effort)
+        run: |
+          # 等待开机脚本执行完（最多 3 分钟）
+          for i in $(seq 1 18); do
+            if nc -zvw3 "${{ steps.ec2.outputs.public_ip }}" 22 >/dev/null 2>&1; then
+              echo "SSH port open"; break
+            fi
+            echo "waiting ssh... ($i)"; sleep 10
+          done
+
+      - name: Output summary
+        run: |
+          echo "### DEV EC2 provisioned" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Instance: \`${{ steps.ec2.outputs.instance_id }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Public IP: \`${{ steps.ec2.outputs.public_ip }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- SG: \`${{ steps.sg.outputs.sg_id }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Admin CIDRs: \`${{ steps.vars.outputs.admin_cidrs }}\`" >> "$GITHUB_STEP_SUMMARY"
